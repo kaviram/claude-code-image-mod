@@ -1,0 +1,6 @@
+{
+  "name": "image-mod",
+  "version": "0.1.0",
+  "description": "Image generation tool and gallery pane: OpenAI or Replicate, pick the model and paste keys in the pane.",
+  "types": "./types/index.d.ts"
+}
