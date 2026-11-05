@@ -12,7 +12,7 @@ if your shell has none, and scroll through everything that was generated.
   reference images (edits), and saves PNG/JPG files to disk. The result is the
   list of file paths, so Claude can open them with Read and send them to you.
 - **Images pane** (`/images`): provider picker, model picker (OpenAI:
-  `gpt-image-1`, `dall-e-3`; Replicate: Flux, Ideogram, Recraft, Imagen,
+  `gpt-image-2` (default), `gpt-image-1.5`, `gpt-image-1`, `dall-e-3`; Replicate: Flux, Ideogram, Recraft, Imagen,
   Seedream, SD 3.5, or any custom `owner/name`), key entry per provider,
   output folder, and a scrollable gallery of thumbnails with Open / Copy path /
   Remove buttons and Newer / Older paging.

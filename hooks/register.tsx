@@ -10,7 +10,7 @@ const PAGE_SIZE = 6
 const GALLERY_CAP = 60
 const THUMB_PX = 240
 
-const OPENAI_MODELS = ['gpt-image-1', 'dall-e-3']
+const OPENAI_MODELS = ['gpt-image-2', 'gpt-image-1.5', 'gpt-image-1', 'dall-e-3']
 const REPLICATE_MODELS = [
   'black-forest-labs/flux-schnell',
   'black-forest-labs/flux-dev',
@@ -27,7 +27,7 @@ const CUSTOM = '__custom__'
 
 const DEFAULT_SETTINGS: ImgSettings = {
   provider: 'openai',
-  openaiModel: 'gpt-image-1',
+  openaiModel: 'gpt-image-2',
   replicateModel: 'black-forest-labs/flux-schnell',
   outputDir: '',
 }
@@ -36,16 +36,16 @@ const NO_KEYS: ImgKeyStatus = {
   replicate: { has: false, source: 'none', hint: '' },
 }
 
-const settings = atom({ plugin: PLUGIN, key: 'settings' } as const, DEFAULT_SETTINGS)
-const keyStatus = atom({ plugin: PLUGIN, key: 'keys' } as const, NO_KEYS)
-const gallery = atom({ plugin: PLUGIN, key: 'gallery' } as const, [])
-const editing = atom({ plugin: PLUGIN, key: 'editing' } as const, {
+const settings = atom({ plugin: 'image-mod', key: 'settings' } as const, DEFAULT_SETTINGS)
+const keyStatus = atom({ plugin: 'image-mod', key: 'keys' } as const, NO_KEYS)
+const gallery = atom({ plugin: 'image-mod', key: 'gallery' } as const, [])
+const editing = atom({ plugin: 'image-mod', key: 'editing' } as const, {
   openaiKey: false,
   replicateKey: false,
   customModel: false,
 })
-const busy = atom({ plugin: PLUGIN, key: 'busy' } as const, '')
-const page = atom({ plugin: PLUGIN, key: 'page' } as const, 0)
+const busy = atom({ plugin: 'image-mod', key: 'busy' } as const, '')
+const page = atom({ plugin: 'image-mod', key: 'page' } as const, 0)
 
 type Keys = Partial<Record<ImgProvider, string>>
 type Dollar = EngineInterface
@@ -83,7 +83,7 @@ const INPUT_SCHEMA = {
     model: {
       type: 'string',
       description:
-        'Model override. OpenAI: gpt-image-1 or dall-e-3. Replicate: any owner/name (optionally owner/name:version), e.g. black-forest-labs/flux-1.1-pro, ideogram-ai/ideogram-v3-turbo, recraft-ai/recraft-v3, google/imagen-4.',
+        'Model override. OpenAI: gpt-image-2 (default), gpt-image-1.5, gpt-image-1 or dall-e-3. Replicate: any owner/name (optionally owner/name:version), e.g. black-forest-labs/flux-1.1-pro, ideogram-ai/ideogram-v3-turbo, recraft-ai/recraft-v3, google/imagen-4.',
     },
     size: {
       type: 'string',
@@ -133,312 +133,359 @@ const ratioToSize = (ratio: string, base = 1024): string => {
   return `${round(w)}x${round(h)}`
 }
 
-export const register: Register = on => {
-  // The keys live only here and in $.store, never in $.state or any result.
-  const keys: Keys = {}
-  const keySource: Partial<Record<ImgProvider, 'env' | 'pane'>> = {}
+// Module-level helpers: the engine's loader only lets $ be passed to functions
+// declared at the top of the file. Keys live only here and in $.store, never in
+// $.state or any tool result.
+const keys: Keys = {}
+const keySource: Partial<Record<ImgProvider, 'env' | 'pane'>> = {}
 
-  const publishKeyStatus = ($: Dollar) =>
-    update($, keyStatus, () => ({
-      openai: { has: !!keys.openai, source: keySource.openai ?? 'none', hint: keys.openai ? hintOf(keys.openai) : '' },
-      replicate: {
-        has: !!keys.replicate,
-        source: keySource.replicate ?? 'none',
-        hint: keys.replicate ? hintOf(keys.replicate) : '',
-      },
-    }))
+const publishKeyStatus = ($: Dollar) =>
+  update($, keyStatus, () => ({
+    openai: { has: !!keys.openai, source: keySource.openai ?? 'none', hint: keys.openai ? hintOf(keys.openai) : '' },
+    replicate: {
+      has: !!keys.replicate,
+      source: keySource.replicate ?? 'none',
+      hint: keys.replicate ? hintOf(keys.replicate) : '',
+    },
+  }))
 
-  const loadKeys = async ($: Dollar) => {
-    const stored = ((await $.store.get('keys')) ?? {}) as Keys
-    const envOpenai = await $.env.get('OPENAI_API_KEY')
-    const envReplicate = await $.env.get('REPLICATE_API_TOKEN')
-    keys.openai = envOpenai || stored.openai || undefined
-    keys.replicate = envReplicate || stored.replicate || undefined
-    keySource.openai = envOpenai ? 'env' : stored.openai ? 'pane' : undefined
-    keySource.replicate = envReplicate ? 'env' : stored.replicate ? 'pane' : undefined
-    await publishKeyStatus($)
+const loadKeys = async ($: Dollar) => {
+  const stored = ((await $.store.get('keys')) ?? {}) as Keys
+  const envOpenai = await $.env.get('OPENAI_API_KEY')
+  const envReplicate = await $.env.get('REPLICATE_API_TOKEN')
+  keys.openai = envOpenai || stored.openai || undefined
+  keys.replicate = envReplicate || stored.replicate || undefined
+  keySource.openai = envOpenai ? 'env' : stored.openai ? 'pane' : undefined
+  keySource.replicate = envReplicate ? 'env' : stored.replicate ? 'pane' : undefined
+  await publishKeyStatus($)
+}
+
+const saveKey = async ($: Dollar, provider: ImgProvider, value: string) => {
+  const key = value.trim()
+  if (!key) return
+  const stored = ((await $.store.get('keys')) ?? {}) as Keys
+  await $.store.set('keys', { ...stored, [provider]: key })
+  keys[provider] = key
+  keySource[provider] = 'pane'
+  await publishKeyStatus($)
+  await update($, editing, ed => ({ ...ed, [provider === 'openai' ? 'openaiKey' : 'replicateKey']: false }))
+  $.ui.toast(`${provider === 'openai' ? 'OpenAI' : 'Replicate'} key saved (${hintOf(key)})`)
+}
+
+const forgetKey = async ($: Dollar, provider: ImgProvider) => {
+  const stored = ((await $.store.get('keys')) ?? {}) as Keys
+  delete stored[provider]
+  await $.store.set('keys', stored)
+  await loadKeys($)
+  $.ui.toast(`${provider === 'openai' ? 'OpenAI' : 'Replicate'} key forgotten`)
+}
+
+const loadSettings = async ($: Dollar) => {
+  const stored = ((await $.store.get('settings')) ?? {}) as Partial<ImgSettings>
+  await update($, settings, () => ({ ...DEFAULT_SETTINGS, ...stored }))
+}
+
+const saveSettings = async ($: Dollar, patch: Partial<ImgSettings>) => {
+  const next = { ...(await read($, settings)), ...patch }
+  await update($, settings, () => next)
+  await $.store.set('settings', next)
+}
+
+const loadGallery = async ($: Dollar) => {
+  const stored = ((await $.store.get('gallery')) ?? []) as ImgEntry[]
+  await update($, gallery, () => stored)
+}
+
+const addEntries = async ($: Dollar, entries: ImgEntry[]) => {
+  const next = [...entries, ...(await read($, gallery))].slice(0, GALLERY_CAP)
+  await update($, gallery, () => next)
+  await update($, page, () => 0)
+  await $.store.set('gallery', next)
+}
+
+const removeEntry = async ($: Dollar, id: string) => {
+  const next = (await read($, gallery)).filter(entry => entry.id !== id)
+  await update($, gallery, () => next)
+  await $.store.set('gallery', next)
+}
+
+const resolveOutputDir = async ($: Dollar, requested?: string) => {
+  const home = (await $.env.get('HOME')) ?? '.'
+  const configured = (await read($, settings)).outputDir
+  const dir = (requested || configured || `${home}/Pictures/claude-images`).replace(/^~(?=\/|$)/, home)
+  await $.process.run(['mkdir', '-p', dir])
+  return dir
+}
+
+/** curl with the key in the environment, never on the command line. */
+/** curl with the key in the environment; the reply lands in outFile and is not read here. */
+const curlToFile = async ($: Dollar, key: string, args: string[], timeoutMs: number, outFile: string) => {
+  const ran = await $.process.run(
+    ['sh', '-c', 'exec curl -sS -H "Authorization: Bearer $IMAGE_MOD_KEY" "$@"', 'curl', '-o', outFile, ...args],
+    { env: { IMAGE_MOD_KEY: key }, timeoutMs },
+  )
+  if (ran.exitCode !== 0) throw new Error(`curl failed: ${ran.stderr.trim().slice(0, 300)}`)
+}
+
+/**
+ * Decodes an OpenAI images reply on the host: the JSON can be many megabytes,
+ * past what the plugin may read, so Python writes the PNGs and reports paths.
+ */
+const DECODE_OPENAI_REPLY = `
+import base64, json, sys, urllib.request
+resp, outdir, base = sys.argv[1:4]
+d = json.load(open(resp))
+if d.get('error'):
+    print(json.dumps({'error': (d['error'] or {}).get('message', 'unknown error')})); sys.exit(0)
+files, notes = [], []
+for i, item in enumerate(d.get('data', [])):
+    path = f"{outdir}/{base}{'' if i == 0 else '-' + str(i + 1)}.png"
+    if item.get('b64_json'):
+        open(path, 'wb').write(base64.b64decode(item['b64_json']))
+    elif item.get('url'):
+        urllib.request.urlretrieve(item['url'], path)
+    else:
+        continue
+    files.append(path)
+    if item.get('revised_prompt'):
+        notes.append('revised prompt: ' + item['revised_prompt'])
+print(json.dumps({'files': files, 'notes': notes}))
+`
+const decodeOpenAiReply = async ($: Dollar, responseFile: string, dir: string, base: string) => {
+  const ran = await $.process.run(['/usr/bin/python3', '-I', '-c', DECODE_OPENAI_REPLY, responseFile, dir, base], { timeoutMs: 120_000 })
+  if (ran.exitCode !== 0) throw new Error(`decode failed: ${ran.stderr.trim().slice(0, 300)}`)
+  return JSON.parse(ran.stdout) as { error?: string; files?: string[]; notes?: string[] }
+}
+
+const curl = async ($: Dollar, key: string, args: string[], timeoutMs: number, outFile: string) => {
+  // The reply is written to a file and read back: a multi-megabyte image
+  // reply overflows the process's captured stdout and arrives cut off.
+  const ran = await $.process.run(
+    ['sh', '-c', 'exec curl -sS -H "Authorization: Bearer $IMAGE_MOD_KEY" "$@"', 'curl', '-o', outFile, ...args],
+    { env: { IMAGE_MOD_KEY: key }, timeoutMs },
+  )
+  if (ran.exitCode !== 0) throw new Error(`curl failed: ${ran.stderr.trim().slice(0, 300)}`)
+  try {
+    return await $.fs.read(outFile)
+  } finally {
+    await $.process.run(['rm', '-f', outFile])
   }
+}
 
-  const saveKey = async ($: Dollar, provider: ImgProvider, value: string) => {
-    const key = value.trim()
-    if (!key) return
-    const stored = ((await $.store.get('keys')) ?? {}) as Keys
-    await $.store.set('keys', { ...stored, [provider]: key })
-    keys[provider] = key
-    keySource[provider] = 'pane'
-    await publishKeyStatus($)
-    await update($, editing, ed => ({ ...ed, [provider === 'openai' ? 'openaiKey' : 'replicateKey']: false }))
-    $.ui.toast(`${provider === 'openai' ? 'OpenAI' : 'Replicate'} key saved (${hintOf(key)})`)
-  }
+const writeBase64 = async ($: Dollar, base64: string, path: string) => {
+  const ran = await $.process.run(['sh', '-c', 'base64 -d > "$1"', 'sh', path], { stdin: base64, timeoutMs: 60_000 })
+  if (ran.exitCode !== 0) throw new Error(`decode failed: ${ran.stderr.trim()}`)
+}
 
-  const forgetKey = async ($: Dollar, provider: ImgProvider) => {
-    const stored = ((await $.store.get('keys')) ?? {}) as Keys
-    delete stored[provider]
-    await $.store.set('keys', stored)
-    await loadKeys($)
-    $.ui.toast(`${provider === 'openai' ? 'OpenAI' : 'Replicate'} key forgotten`)
-  }
+const download = async ($: Dollar, url: string, path: string) => {
+  const ran = await $.process.run(['curl', '-sSL', '-o', path, url], { timeoutMs: 120_000 })
+  if (ran.exitCode !== 0) throw new Error(`download failed: ${ran.stderr.trim().slice(0, 300)}`)
+}
 
-  const loadSettings = async ($: Dollar) => {
-    const stored = ((await $.store.get('settings')) ?? {}) as Partial<ImgSettings>
-    await update($, settings, () => ({ ...DEFAULT_SETTINGS, ...stored }))
-  }
+const dimensions = async ($: Dollar, path: string) => {
+  const ran = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', path])
+  const width = Number(/pixelWidth:\s*(\d+)/.exec(ran.stdout)?.[1] ?? 0)
+  const height = Number(/pixelHeight:\s*(\d+)/.exec(ran.stdout)?.[1] ?? 0)
+  return { width, height }
+}
 
-  const saveSettings = async ($: Dollar, patch: Partial<ImgSettings>) => {
-    const next = { ...(await read($, settings)), ...patch }
-    await update($, settings, () => next)
-    await $.store.set('settings', next)
-  }
+const thumbnail = async ($: Dollar, path: string) => {
+  const thumbPath = path.replace(/\.[a-z0-9]+$/i, '') + '.thumb.jpg'
+  const ran = await $.process.run([
+    'sips', '-Z', String(THUMB_PX), '-s', 'format', 'jpeg', '-s', 'formatOptions', '70', path, '--out', thumbPath,
+  ])
+  if (ran.exitCode !== 0) throw new Error(`thumbnail failed: ${ran.stderr.trim()}`)
+  const { base64 } = await $.fs.read(thumbPath, { as: 'bytes' })
+  const { width, height } = await dimensions($, thumbPath)
+  await $.process.run(['rm', '-f', thumbPath])
+  return { thumb: base64, thumbWidth: width, thumbHeight: height }
+}
 
-  const loadGallery = async ($: Dollar) => {
-    const stored = ((await $.store.get('gallery')) ?? []) as ImgEntry[]
-    await update($, gallery, () => stored)
-  }
+const generateOpenAI = async ($: Dollar, key: string, model: string, req: GenerateInput, dir: string, base: string): Promise<Generated> => {
+  const count = Math.min(4, Math.max(1, req.count ?? 1))
+  const isDalle = model.startsWith('dall-e')
+  const refs = req.reference_images ?? []
+  const responseFile = `${dir}/.${base}.response.json`
 
-  const addEntries = async ($: Dollar, entries: ImgEntry[]) => {
-    const next = [...entries, ...(await read($, gallery))].slice(0, GALLERY_CAP)
-    await update($, gallery, () => next)
-    await update($, page, () => 0)
-    await $.store.set('gallery', next)
-  }
-
-  const removeEntry = async ($: Dollar, id: string) => {
-    const next = (await read($, gallery)).filter(entry => entry.id !== id)
-    await update($, gallery, () => next)
-    await $.store.set('gallery', next)
-  }
-
-  const resolveOutputDir = async ($: Dollar, requested?: string) => {
-    const home = (await $.env.get('HOME')) ?? '.'
-    const configured = (await read($, settings)).outputDir
-    const dir = (requested || configured || `${home}/Pictures/claude-images`).replace(/^~(?=\/|$)/, home)
-    await $.process.run(['mkdir', '-p', dir])
-    return dir
-  }
-
-  /** curl with the key in the environment, never on the command line. */
-  const curl = async ($: Dollar, key: string, args: string[], timeoutMs: number) => {
-    const ran = await $.process.run(
-      ['sh', '-c', 'exec curl -sS -H "Authorization: Bearer $IMAGE_MOD_KEY" "$@"', 'curl', ...args],
-      { env: { IMAGE_MOD_KEY: key }, timeoutMs },
-    )
-    if (ran.exitCode !== 0) throw new Error(`curl failed: ${ran.stderr.trim().slice(0, 300)}`)
-    return ran.stdout
-  }
-
-  const writeBase64 = async ($: Dollar, base64: string, path: string) => {
-    const ran = await $.process.run(['sh', '-c', 'base64 -d > "$1"', 'sh', path], { stdin: base64, timeoutMs: 60_000 })
-    if (ran.exitCode !== 0) throw new Error(`decode failed: ${ran.stderr.trim()}`)
-  }
-
-  const download = async ($: Dollar, url: string, path: string) => {
-    const ran = await $.process.run(['curl', '-sSL', '-o', path, url], { timeoutMs: 120_000 })
-    if (ran.exitCode !== 0) throw new Error(`download failed: ${ran.stderr.trim().slice(0, 300)}`)
-  }
-
-  const dimensions = async ($: Dollar, path: string) => {
-    const ran = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', path])
-    const width = Number(/pixelWidth:\s*(\d+)/.exec(ran.stdout)?.[1] ?? 0)
-    const height = Number(/pixelHeight:\s*(\d+)/.exec(ran.stdout)?.[1] ?? 0)
-    return { width, height }
-  }
-
-  const thumbnail = async ($: Dollar, path: string) => {
-    const thumbPath = path.replace(/\.[a-z0-9]+$/i, '') + '.thumb.jpg'
-    const ran = await $.process.run([
-      'sips', '-Z', String(THUMB_PX), '-s', 'format', 'jpeg', '-s', 'formatOptions', '70', path, '--out', thumbPath,
-    ])
-    if (ran.exitCode !== 0) throw new Error(`thumbnail failed: ${ran.stderr.trim()}`)
-    const { base64 } = await $.fs.read(thumbPath, { as: 'bytes' })
-    const { width, height } = await dimensions($, thumbPath)
-    await $.process.run(['rm', '-f', thumbPath])
-    return { thumb: base64, thumbWidth: width, thumbHeight: height }
-  }
-
-  const generateOpenAI = async ($: Dollar, key: string, model: string, req: GenerateInput, dir: string, base: string): Promise<Generated> => {
-    const count = Math.min(4, Math.max(1, req.count ?? 1))
-    const isDalle = model.startsWith('dall-e')
-    const refs = req.reference_images ?? []
-    let json: string
-
-    if (refs.length > 0) {
-      const promptFile = `${dir}/.${base}.prompt.txt`
-      await $.fs.write(promptFile, req.prompt)
-      const args = ['https://api.openai.com/v1/images/edits', '-F', `model=${model}`, '-F', `prompt=<${promptFile}`, '-F', `n=${count}`]
-      if (req.size) args.push('-F', `size=${req.size}`)
-      if (req.quality && !isDalle) args.push('-F', `quality=${req.quality}`)
-      for (const ref of refs) args.push('-F', `image[]=@${ref}`)
-      json = await curl($, key, args, 300_000)
-      await $.process.run(['rm', '-f', promptFile])
-    } else {
-      const body: Record<string, unknown> = { model, prompt: req.prompt, n: isDalle ? 1 : count, ...(req.extra ?? {}) }
-      if (req.size) body.size = req.size
-      if (req.quality) body.quality = req.quality
-      if (isDalle) body.response_format = 'b64_json'
-      const res = await $.http.fetch('https://api.openai.com/v1/images/generations', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      json = res.text
-      if (!res.ok) throw new Error(`OpenAI ${res.status}: ${errorMessage(json)}`)
-    }
-
-    const parsed = JSON.parse(json) as { error?: { message?: string }; data?: { b64_json?: string; url?: string; revised_prompt?: string }[] }
-    if (parsed.error) throw new Error(`OpenAI: ${parsed.error.message ?? 'unknown error'}`)
-    const files: string[] = []
-    const notes: string[] = []
-    for (const [i, item] of (parsed.data ?? []).entries()) {
-      const path = `${dir}/${base}${i > 0 ? `-${i + 1}` : ''}.png`
-      if (item.b64_json) await writeBase64($, item.b64_json, path)
-      else if (item.url) await download($, item.url, path)
-      else continue
-      files.push(path)
-      if (item.revised_prompt) notes.push(`revised prompt: ${item.revised_prompt}`)
-    }
-    if (files.length === 0) throw new Error('OpenAI returned no images')
-    return { provider: 'openai', model, files, note: notes.join('\n') }
-  }
-
-  const generateReplicate = async ($: Dollar, key: string, model: string, req: GenerateInput, dir: string, base: string): Promise<Generated> => {
-    const count = Math.min(4, Math.max(1, req.count ?? 1))
-    const extra = { ...(req.extra ?? {}) }
-    const imageKey = typeof extra.image_key === 'string' ? extra.image_key : model.includes('kontext') ? 'input_image' : 'image'
-    delete extra.image_key
-
-    const input: Record<string, unknown> = { prompt: req.prompt }
-    const ratio = req.aspect_ratio ?? '1:1'
-    if (model.includes('recraft')) input.size = ratioToSize(ratio)
-    else input.aspect_ratio = ratio
-    if (count > 1) input.num_outputs = count
-
-    const refs = req.reference_images ?? []
-    if (refs.length > 0) {
-      const urls: string[] = []
-      for (const ref of refs) {
-        const uploaded = JSON.parse(await curl($, key, ['https://api.replicate.com/v1/files', '-F', `content=@${ref}`], 120_000)) as {
-          urls?: { get?: string }
-          detail?: string
-        }
-        if (!uploaded.urls?.get) throw new Error(`Replicate upload failed: ${uploaded.detail ?? 'no url'}`)
-        urls.push(uploaded.urls.get)
-      }
-      input[imageKey] = urls.length === 1 ? urls[0] : urls
-    }
-    Object.assign(input, extra)
-
-    const [name, version] = model.split(':')
-    const endpoint = version ? 'https://api.replicate.com/v1/predictions' : `https://api.replicate.com/v1/models/${name}/predictions`
-    const body = version ? { version, input } : { input }
-    const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Prefer: 'wait=60' }
-    const created = await $.http.fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body) })
-    if (!created.ok) throw new Error(`Replicate ${created.status}: ${errorMessage(created.text)}`)
-
-    type Prediction = { id: string; status: string; output?: unknown; error?: string | null; urls?: { get?: string } }
-    let prediction = JSON.parse(created.text) as Prediction
-    const deadline = (await $.clock.now()) + 5 * 60_000
-    while (!['succeeded', 'failed', 'canceled'].includes(prediction.status)) {
-      if ((await $.clock.now()) > deadline) throw new Error('Replicate: timed out after 5 minutes')
-      await $.clock.sleep(2000)
-      const poll = await $.http.fetch(prediction.urls?.get ?? `https://api.replicate.com/v1/predictions/${prediction.id}`, { headers })
-      prediction = JSON.parse(poll.text) as Prediction
-    }
-    if (prediction.status !== 'succeeded') throw new Error(`Replicate ${prediction.status}: ${prediction.error ?? 'no detail'}`)
-
-    const outputs: string[] =
-      typeof prediction.output === 'string'
-        ? [prediction.output]
-        : Array.isArray(prediction.output)
-          ? prediction.output.filter((item): item is string => typeof item === 'string')
-          : []
-    if (outputs.length === 0) throw new Error(`Replicate returned no image URLs (output: ${JSON.stringify(prediction.output).slice(0, 200)})`)
-
-    const files: string[] = []
-    for (const [i, url] of outputs.entries()) {
-      const ext = /\.(png|jpe?g|webp|gif)(\?|$)/i.exec(url)?.[1]?.toLowerCase().replace('jpeg', 'jpg') ?? 'png'
-      const path = `${dir}/${base}${i > 0 ? `-${i + 1}` : ''}.${ext}`
-      await download($, url, path)
-      files.push(path)
-    }
-    return { provider: 'replicate', model, files, note: '' }
-  }
-
-  const errorMessage = (json: string) => {
+  if (refs.length > 0) {
+    const promptFile = `${dir}/.${base}.prompt.txt`
+    await $.fs.write(promptFile, req.prompt)
+    const args = ['https://api.openai.com/v1/images/edits', '-F', `model=${model}`, '-F', `prompt=<${promptFile}`, '-F', `n=${count}`]
+    if (req.size) args.push('-F', `size=${req.size}`)
+    if (req.quality && !isDalle) args.push('-F', `quality=${req.quality}`)
+    for (const ref of refs) args.push('-F', `image[]=@${ref}`)
     try {
-      const parsed = JSON.parse(json) as { error?: { message?: string } | string; detail?: string }
-      if (typeof parsed.error === 'string') return parsed.error
-      return parsed.error?.message ?? parsed.detail ?? json.slice(0, 300)
-    } catch {
-      return json.slice(0, 300)
-    }
-  }
-
-  /** Runs one generation end to end and records it in the gallery. */
-  const generate = async ($: Dollar, req: GenerateInput): Promise<{ generated: Generated; entries: ImgEntry[] }> => {
-    const current = await read($, settings)
-    let provider: ImgProvider = req.provider ?? current.provider
-    if (!keys[provider]) {
-      const other: ImgProvider = provider === 'openai' ? 'replicate' : 'openai'
-      if (req.provider || !keys[other]) {
-        throw new Error(
-          keys[other]
-            ? `No ${provider} key is set; ${other} is available. Call again with provider "${other}" or paste a key in the Images pane (/images).`
-            : 'No image API key is set. Paste an OpenAI or Replicate key in the Images pane (/images), or export OPENAI_API_KEY / REPLICATE_API_TOKEN.',
-        )
-      }
-      provider = other
-    }
-    const key = keys[provider] as string
-    const model = req.model ?? (provider === 'openai' ? current.openaiModel : current.replicateModel)
-    const dir = await resolveOutputDir($, req.output_dir)
-    const base = req.filename?.trim() || `${stamp(await $.clock.now())}-${slug(req.prompt)}`
-
-    await update($, busy, () => `Generating with ${provider} · ${model}…`)
-    $.ui.status(`image: ${model}`)
-    try {
-      const generated =
-        provider === 'openai'
-          ? await generateOpenAI($, key, model, req, dir, base)
-          : await generateReplicate($, key, model, req, dir, base)
-      const entries: ImgEntry[] = []
-      for (const path of generated.files) {
-        const { width, height } = await dimensions($, path)
-        const thumb = await thumbnail($, path)
-        entries.push({
-          id: `${base}-${entries.length}`,
-          path,
-          provider,
-          model,
-          prompt: req.prompt,
-          width,
-          height,
-          createdAt: await $.clock.now(),
-          ...thumb,
-        })
-      }
-      await addEntries($, entries)
-      void $.ui.open({ id: PANE, title: 'Images' })
-      return { generated, entries }
+      await curlToFile($, key, args, 300_000, responseFile)
     } finally {
-      await update($, busy, () => '')
-      $.ui.status(undefined)
+      await $.process.run(['rm', '-f', promptFile])
+    }
+  } else {
+    const body: Record<string, unknown> = { model, prompt: req.prompt, n: isDalle ? 1 : count, ...(req.extra ?? {}) }
+    if (req.size) body.size = req.size
+    if (req.quality) body.quality = req.quality
+    if (isDalle) body.response_format = 'b64_json'
+    // The host's $.http.fetch gives up after 30 s and a generation takes
+    // longer, so the request goes through curl with the key in the environment.
+    const bodyFile = `${dir}/.${base}.body.json`
+    await $.fs.write(bodyFile, JSON.stringify(body))
+    try {
+      await curlToFile($, key, ['https://api.openai.com/v1/images/generations', '-H', 'Content-Type: application/json', '--data-binary', `@${bodyFile}`], 300_000, responseFile)
+    } finally {
+      await $.process.run(['rm', '-f', bodyFile])
     }
   }
 
-  const describe = (generated: Generated) =>
-    [
-      `Generated ${generated.files.length} image${generated.files.length === 1 ? '' : 's'} with ${generated.provider} (${generated.model}):`,
-      ...generated.files,
-      generated.note,
-      'Open a path with the Read tool to look at it; send it to the person with SendUserFile.',
-    ]
-      .filter(Boolean)
-      .join('\n')
+  let decoded: { error?: string; files?: string[]; notes?: string[] }
+  try {
+    decoded = await decodeOpenAiReply($, responseFile, dir, base)
+  } finally {
+    await $.process.run(['rm', '-f', responseFile])
+  }
+  if (decoded.error) throw new Error(`OpenAI: ${decoded.error}`)
+  const files = decoded.files ?? []
+  if (files.length === 0) throw new Error('OpenAI returned no images')
+  return { provider: 'openai', model, files, note: (decoded.notes ?? []).join('\n') }
+}
 
+const generateReplicate = async ($: Dollar, key: string, model: string, req: GenerateInput, dir: string, base: string): Promise<Generated> => {
+  const count = Math.min(4, Math.max(1, req.count ?? 1))
+  const extra = { ...(req.extra ?? {}) }
+  const imageKey = typeof extra.image_key === 'string' ? extra.image_key : model.includes('kontext') ? 'input_image' : 'image'
+  delete extra.image_key
+
+  const input: Record<string, unknown> = { prompt: req.prompt }
+  const ratio = req.aspect_ratio ?? '1:1'
+  if (model.includes('recraft')) input.size = ratioToSize(ratio)
+  else input.aspect_ratio = ratio
+  if (count > 1) input.num_outputs = count
+
+  const refs = req.reference_images ?? []
+  if (refs.length > 0) {
+    const urls: string[] = []
+    for (const ref of refs) {
+      const uploaded = JSON.parse(await curl($, key, ['https://api.replicate.com/v1/files', '-F', `content=@${ref}`], 120_000, `${dir}/.${base}.upload.json`)) as {
+        urls?: { get?: string }
+        detail?: string
+      }
+      if (!uploaded.urls?.get) throw new Error(`Replicate upload failed: ${uploaded.detail ?? 'no url'}`)
+      urls.push(uploaded.urls.get)
+    }
+    input[imageKey] = urls.length === 1 ? urls[0] : urls
+  }
+  Object.assign(input, extra)
+
+  const [name, version] = model.split(':')
+  const endpoint = version ? 'https://api.replicate.com/v1/predictions' : `https://api.replicate.com/v1/models/${name}/predictions`
+  const body = version ? { version, input } : { input }
+  const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Prefer: 'wait=20' }
+  const created = await $.http.fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body) })
+  if (!created.ok) throw new Error(`Replicate ${created.status}: ${errorMessage(created.text)}`)
+
+  type Prediction = { id: string; status: string; output?: unknown; error?: string | null; urls?: { get?: string } }
+  let prediction = JSON.parse(created.text) as Prediction
+  const deadline = (await $.clock.now()) + 5 * 60_000
+  while (!['succeeded', 'failed', 'canceled'].includes(prediction.status)) {
+    if ((await $.clock.now()) > deadline) throw new Error('Replicate: timed out after 5 minutes')
+    await $.clock.sleep(2000)
+    const poll = await $.http.fetch(prediction.urls?.get ?? `https://api.replicate.com/v1/predictions/${prediction.id}`, { headers })
+    prediction = JSON.parse(poll.text) as Prediction
+  }
+  if (prediction.status !== 'succeeded') throw new Error(`Replicate ${prediction.status}: ${prediction.error ?? 'no detail'}`)
+
+  const outputs: string[] =
+    typeof prediction.output === 'string'
+      ? [prediction.output]
+      : Array.isArray(prediction.output)
+        ? prediction.output.filter((item): item is string => typeof item === 'string')
+        : []
+  if (outputs.length === 0) throw new Error(`Replicate returned no image URLs (output: ${JSON.stringify(prediction.output).slice(0, 200)})`)
+
+  const files: string[] = []
+  for (const [i, url] of outputs.entries()) {
+    const ext = /\.(png|jpe?g|webp|gif)(\?|$)/i.exec(url)?.[1]?.toLowerCase().replace('jpeg', 'jpg') ?? 'png'
+    const path = `${dir}/${base}${i > 0 ? `-${i + 1}` : ''}.${ext}`
+    await download($, url, path)
+    files.push(path)
+  }
+  return { provider: 'replicate', model, files, note: '' }
+}
+
+const errorMessage = (json: string) => {
+  try {
+    const parsed = JSON.parse(json) as { error?: { message?: string } | string; detail?: string }
+    if (typeof parsed.error === 'string') return parsed.error
+    return parsed.error?.message ?? parsed.detail ?? json.slice(0, 300)
+  } catch {
+    return json.slice(0, 300)
+  }
+}
+
+/** Runs one generation end to end and records it in the gallery. */
+const generate = async ($: Dollar, req: GenerateInput): Promise<{ generated: Generated; entries: ImgEntry[] }> => {
+  const current = await read($, settings)
+  let provider: ImgProvider = req.provider ?? current.provider
+  if (!keys[provider]) {
+    const other: ImgProvider = provider === 'openai' ? 'replicate' : 'openai'
+    if (req.provider || !keys[other]) {
+      throw new Error(
+        keys[other]
+          ? `No ${provider} key is set; ${other} is available. Call again with provider "${other}" or paste a key in the Images pane (/images).`
+          : 'No image API key is set. Paste an OpenAI or Replicate key in the Images pane (/images), or export OPENAI_API_KEY / REPLICATE_API_TOKEN.',
+      )
+    }
+    provider = other
+  }
+  const key = keys[provider] as string
+  const model = req.model ?? (provider === 'openai' ? current.openaiModel : current.replicateModel)
+  const dir = await resolveOutputDir($, req.output_dir)
+  const base = req.filename?.trim() || `${stamp(await $.clock.now())}-${slug(req.prompt)}`
+
+  await update($, busy, () => `Generating with ${provider} · ${model}…`)
+  $.ui.status(`image: ${model}`)
+  try {
+    const generated =
+      provider === 'openai'
+        ? await generateOpenAI($, key, model, req, dir, base)
+        : await generateReplicate($, key, model, req, dir, base)
+    const entries: ImgEntry[] = []
+    for (const path of generated.files) {
+      const { width, height } = await dimensions($, path)
+      const thumb = await thumbnail($, path)
+      entries.push({
+        id: `${base}-${entries.length}`,
+        path,
+        provider,
+        model,
+        prompt: req.prompt,
+        width,
+        height,
+        createdAt: await $.clock.now(),
+        ...thumb,
+      })
+    }
+    await addEntries($, entries)
+    void $.ui.open({ id: PANE, title: 'Images' })
+    return { generated, entries }
+  } finally {
+    await update($, busy, () => '')
+    $.ui.status(undefined)
+  }
+}
+
+const describe = (generated: Generated) =>
+  [
+    `Generated ${generated.files.length} image${generated.files.length === 1 ? '' : 's'} with ${generated.provider} (${generated.model}):`,
+    ...generated.files,
+    generated.note,
+    'Open a path with the Read tool to look at it; send it to the person with SendUserFile.',
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await loadKeys($)
-    await loadSettings($)
-    await loadGallery($)
+    // Register the tool and commands first, so a failure loading keys or the
+    // gallery can never leave the session without them; then say we are here.
     await $.tool.register({
       name: 'generate_image',
       description:
@@ -447,17 +494,29 @@ export const register: Register = on => {
     })
     await $.command.register({ name: 'images', description: 'Open the image gallery and settings pane' })
     await $.command.register({ name: 'image', description: 'Generate an image from a prompt with the current provider and model' })
+    let problem = ''
+    try {
+      await loadKeys($)
+      await loadSettings($)
+      await loadGallery($)
+    } catch (error) {
+      problem = error instanceof Error ? error.message : String(error)
+    }
+    const has = problem ? 'keys not loaded' : `OpenAI key: ${keys.openai ? 'yes' : 'no'} · Replicate key: ${keys.replicate ? 'yes' : 'no'}`
+    $.ui.toast(`Image mod loaded (${has}). Type /images for the pane.`)
+    if (problem) $.ui.log(`image-mod: startup problem: ${problem}`)
     return next(e)
   })
 
-  on('tool.call', { tool: TOOL }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__image-mod__generate_image' }, async ($, e) => {
     const req = e as unknown as GenerateInput
     try {
       const { generated } = await generate($, req)
-      return { result: { content: [{ type: 'text', text: describe(generated) }], isError: false } }
+      // A plugin tool's result is the text the model reads (or content blocks).
+      return { result: describe(generated) }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      return { result: { content: [{ type: 'text', text: `Image generation failed: ${message}` }], isError: true } }
+      return { deny: `Image generation failed: ${message}` }
     }
   })
 
