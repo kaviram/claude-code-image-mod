@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ImgEditing, ImgEntry, ImgKeyStatus, ImgProvider, ImgSettings } from '../types'
+import type { ImgEntry, ImgKeyInfo, ImgKeyStatus, ImgProvider, ImgSettings } from '../types'
 
 const PLUGIN = 'image-mod'
 const PANE = 'images'
@@ -23,18 +23,39 @@ const REPLICATE_MODELS = [
   'bytedance/seedream-3',
   'stability-ai/stable-diffusion-3.5-large',
 ]
+const SUME_MODELS = [
+  'gpt-image-2',
+  'gpt-image-2.5',
+  'nano-banana-pro',
+  'nano-banana-2.1',
+  'seedream-5-lite',
+  'seedream-v4',
+  'ideogram-v4.5',
+  'ideogram-v3',
+  'recraft-v4',
+  'grok-image',
+]
+const SUME_API = 'https://api.sume.com'
 const CUSTOM = '__custom__'
+
+const PROVIDERS: ImgProvider[] = ['openai', 'replicate', 'sume']
+const LABEL: Record<ImgProvider, string> = { openai: 'OpenAI', replicate: 'Replicate', sume: 'Sume' }
+const KEY_PLACEHOLDER: Record<ImgProvider, string> = {
+  openai: 'sk-… then Enter',
+  replicate: 'r8_… then Enter',
+  sume: 'sume_live_… then Enter',
+}
+const keyFlag = (provider: ImgProvider) => `${provider}Key` as 'openaiKey' | 'replicateKey' | 'sumeKey'
 
 const DEFAULT_SETTINGS: ImgSettings = {
   provider: 'openai',
   openaiModel: 'gpt-image-2',
   replicateModel: 'black-forest-labs/flux-schnell',
+  sumeModel: 'gpt-image-2',
   outputDir: '',
 }
-const NO_KEYS: ImgKeyStatus = {
-  openai: { has: false, source: 'none', hint: '' },
-  replicate: { has: false, source: 'none', hint: '' },
-}
+const NO_KEY: ImgKeyInfo = { has: false, source: 'none', hint: '' }
+const NO_KEYS: ImgKeyStatus = { openai: NO_KEY, replicate: NO_KEY, sume: NO_KEY }
 
 const settings = atom({ plugin: 'image-mod', key: 'settings' } as const, DEFAULT_SETTINGS)
 const keyStatus = atom({ plugin: 'image-mod', key: 'keys' } as const, NO_KEYS)
@@ -42,6 +63,7 @@ const gallery = atom({ plugin: 'image-mod', key: 'gallery' } as const, [])
 const editing = atom({ plugin: 'image-mod', key: 'editing' } as const, {
   openaiKey: false,
   replicateKey: false,
+  sumeKey: false,
   customModel: false,
 })
 const busy = atom({ plugin: 'image-mod', key: 'busy' } as const, '')
@@ -77,34 +99,34 @@ const INPUT_SCHEMA = {
     prompt: { type: 'string', description: 'What to draw. Be concrete about subject, style, lighting and composition.' },
     provider: {
       type: 'string',
-      enum: ['openai', 'replicate'],
+      enum: ['openai', 'replicate', 'sume'],
       description: 'Which API to use. Omit to use the default picked in the Images pane; a provider with no key is refused and the result names the one that works.',
     },
     model: {
       type: 'string',
       description:
-        'Model override. OpenAI: gpt-image-2 (default), gpt-image-1.5, gpt-image-1 or dall-e-3. Replicate: any owner/name (optionally owner/name:version), e.g. black-forest-labs/flux-1.1-pro, ideogram-ai/ideogram-v3-turbo, recraft-ai/recraft-v3, google/imagen-4.',
+        'Model override. OpenAI: gpt-image-2 (default), gpt-image-1.5, gpt-image-1 or dall-e-3. Replicate: any owner/name (optionally owner/name:version), e.g. black-forest-labs/flux-1.1-pro, ideogram-ai/ideogram-v3-turbo, recraft-ai/recraft-v3, google/imagen-4. Sume: an image-router model id, e.g. gpt-image-2 (default), gpt-image-2.5, nano-banana-pro, nano-banana-2.1, seedream-5-lite, ideogram-v4.5, recraft-v4, grok-image.',
     },
     size: {
       type: 'string',
-      description: 'OpenAI only. gpt-image-1: 1024x1024, 1536x1024, 1024x1536 or auto. dall-e-3: 1024x1024, 1792x1024, 1024x1792.',
+      description: 'OpenAI: gpt-image-1: 1024x1024, 1536x1024, 1024x1536 or auto; dall-e-3: 1024x1024, 1792x1024, 1024x1792. Sume: sent as image_size (a preset or WIDTHxHEIGHT) and wins over aspect_ratio.',
     },
     aspect_ratio: {
       type: 'string',
-      description: 'Replicate only. 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 21:9. Models that take width/height get it converted.',
+      description: 'Replicate and Sume. 1:1, 16:9, 9:16, 4:3, 3:4 (Replicate also 3:2, 2:3, 21:9). Replicate models that take width/height get it converted; Sume refuses a ratio the model does not list.',
     },
     count: { type: 'integer', minimum: 1, maximum: 4, description: 'How many images. Default 1.' },
-    quality: { type: 'string', description: 'OpenAI only. gpt-image-1: low, medium, high, auto. dall-e-3: standard or hd.' },
+    quality: { type: 'string', description: 'OpenAI and Sume. gpt-image models: low, medium, high (OpenAI also auto). dall-e-3: standard or hd.' },
     reference_images: {
       type: 'array',
       items: { type: 'string' },
-      description: 'Absolute paths of images to edit or use as reference. OpenAI uses the edits endpoint; Replicate uploads them and passes the first as the model\'s image input.',
+      description: 'Absolute paths of images to edit or use as reference. OpenAI uses the edits endpoint; Replicate uploads them and passes the first as the model\'s image input; Sume uploads them and sends them as image_urls.',
     },
     output_dir: { type: 'string', description: 'Folder to save into. Default: the pane\'s "Save to" folder, else ~/Pictures/claude-images.' },
     filename: { type: 'string', description: 'Base filename without extension. Default: timestamp plus a slug of the prompt.' },
     extra: {
       type: 'object',
-      description: 'Passed straight through as additional request fields (Replicate: merged into input; OpenAI: merged into the JSON body). Use image_key here to name the Replicate input field for reference images (default image, or input_image for kontext models).',
+      description: 'Passed straight through as additional request fields (Replicate: merged into input; OpenAI and Sume: merged into the JSON body, e.g. Sume resolution or output_format). Use image_key here to name the Replicate input field for reference images (default image, or input_image for kontext models).',
     },
   },
   required: ['prompt'],
@@ -139,24 +161,27 @@ const ratioToSize = (ratio: string, base = 1024): string => {
 const keys: Keys = {}
 const keySource: Partial<Record<ImgProvider, 'env' | 'pane'>> = {}
 
+const keyInfo = (provider: ImgProvider): ImgKeyInfo => {
+  const key = keys[provider]
+  return { has: !!key, source: keySource[provider] ?? 'none', hint: key ? hintOf(key) : '' }
+}
+
 const publishKeyStatus = ($: Dollar) =>
-  update($, keyStatus, () => ({
-    openai: { has: !!keys.openai, source: keySource.openai ?? 'none', hint: keys.openai ? hintOf(keys.openai) : '' },
-    replicate: {
-      has: !!keys.replicate,
-      source: keySource.replicate ?? 'none',
-      hint: keys.replicate ? hintOf(keys.replicate) : '',
-    },
-  }))
+  update($, keyStatus, () => ({ openai: keyInfo('openai'), replicate: keyInfo('replicate'), sume: keyInfo('sume') }))
 
 const loadKeys = async ($: Dollar) => {
   const stored = ((await $.store.get('keys')) ?? {}) as Keys
-  const envOpenai = await $.env.get('OPENAI_API_KEY')
-  const envReplicate = await $.env.get('REPLICATE_API_TOKEN')
-  keys.openai = envOpenai || stored.openai || undefined
-  keys.replicate = envReplicate || stored.replicate || undefined
-  keySource.openai = envOpenai ? 'env' : stored.openai ? 'pane' : undefined
-  keySource.replicate = envReplicate ? 'env' : stored.replicate ? 'pane' : undefined
+  // The engine lists the variables a module reads, so each name is a literal.
+  const env: Keys = {
+    openai: await $.env.get('OPENAI_API_KEY'),
+    replicate: await $.env.get('REPLICATE_API_TOKEN'),
+    sume: await $.env.get('SUME_API_KEY'),
+  }
+  for (const provider of PROVIDERS) {
+    const fromEnv = env[provider]
+    keys[provider] = fromEnv || stored[provider] || undefined
+    keySource[provider] = fromEnv ? 'env' : stored[provider] ? 'pane' : undefined
+  }
   await publishKeyStatus($)
 }
 
@@ -168,8 +193,8 @@ const saveKey = async ($: Dollar, provider: ImgProvider, value: string) => {
   keys[provider] = key
   keySource[provider] = 'pane'
   await publishKeyStatus($)
-  await update($, editing, ed => ({ ...ed, [provider === 'openai' ? 'openaiKey' : 'replicateKey']: false }))
-  $.ui.toast(`${provider === 'openai' ? 'OpenAI' : 'Replicate'} key saved (${hintOf(key)})`)
+  await update($, editing, ed => ({ ...ed, [keyFlag(provider)]: false }))
+  $.ui.toast(`${LABEL[provider]} key saved (${hintOf(key)})`)
 }
 
 const forgetKey = async ($: Dollar, provider: ImgProvider) => {
@@ -177,7 +202,7 @@ const forgetKey = async ($: Dollar, provider: ImgProvider) => {
   delete stored[provider]
   await $.store.set('keys', stored)
   await loadKeys($)
-  $.ui.toast(`${provider === 'openai' ? 'OpenAI' : 'Replicate'} key forgotten`)
+  $.ui.toast(`${LABEL[provider]} key forgotten`)
 }
 
 const loadSettings = async ($: Dollar) => {
@@ -410,6 +435,142 @@ const generateReplicate = async ($: Dollar, key: string, model: string, req: Gen
   return { provider: 'replicate', model, files, note: '' }
 }
 
+const MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }
+
+type SumeErrorBody = { error?: { code?: string; message?: string; retryable?: boolean } }
+const sumeError = (res: { status: number; text: string }) => {
+  try {
+    const parsed = JSON.parse(res.text) as SumeErrorBody
+    if (parsed.error) return `${res.status} ${parsed.error.code ?? ''}: ${parsed.error.message ?? ''}`.trim()
+  } catch {}
+  return `${res.status}: ${res.text.slice(0, 300)}`
+}
+const sumeRetryable = (res: { status: number; text: string }) => {
+  try {
+    const flag = (JSON.parse(res.text) as SumeErrorBody).error?.retryable
+    if (typeof flag === 'boolean') return flag
+  } catch {}
+  return res.status === 429 || res.status >= 500
+}
+const retryAfterMs = (res: { headers: Record<string, string> }, fallback = 5) =>
+  Math.min(30, Math.max(1, Number(res.headers['retry-after'] ?? fallback) || fallback)) * 1000
+
+/** Uploads a local file through a presigned PUT and returns its public URL for image_urls. */
+const sumeUpload = async ($: Dollar, key: string, path: string) => {
+  const ext = /\.([a-z0-9]+)$/i.exec(path)?.[1]?.toLowerCase() ?? ''
+  const contentType = MIME[ext]
+  if (!contentType) throw new Error(`Sume upload: unsupported file type for ${path} (png, jpg, webp or gif)`)
+  const stat = await $.process.run(['stat', '-f', '%z', path])
+  const size = Number(stat.stdout.trim())
+  if (stat.exitCode !== 0 || !size) throw new Error(`Sume upload: cannot read ${path}`)
+  const res = await $.http.fetch(`${SUME_API}/v1/files/generate-upload-url`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content_type: contentType, size_bytes: size, filename: path.split('/').pop() }),
+  })
+  if (!res.ok) throw new Error(`Sume upload ${sumeError(res)}`)
+  const { data } = JSON.parse(res.text) as {
+    data: { public_url: string; upload_url: string; upload_headers?: Record<string, string> }
+  }
+  // The presigned URL carries its own signature: the API key never goes to it.
+  const args = ['curl', '-sS', '--fail-with-body', '-X', 'PUT', '--data-binary', `@${path}`]
+  for (const [name, value] of Object.entries(data.upload_headers ?? { 'content-type': contentType })) args.push('-H', `${name}: ${value}`)
+  args.push(data.upload_url)
+  const put = await $.process.run(args, { timeoutMs: 180_000 })
+  if (put.exitCode !== 0) throw new Error(`Sume upload PUT failed: ${(put.stderr || put.stdout).trim().slice(0, 300)}`)
+  return data.public_url
+}
+
+const generateSume = async ($: Dollar, key: string, model: string, req: GenerateInput, dir: string, base: string): Promise<Generated> => {
+  const auth = { Authorization: `Bearer ${key}` }
+  const count = Math.min(4, Math.max(1, req.count ?? 1))
+  const imageUrls: string[] = []
+  for (const ref of req.reference_images ?? []) imageUrls.push(await sumeUpload($, key, ref))
+
+  // Sume refuses fields a model does not take, so only what was asked for goes in.
+  const body: Record<string, unknown> = { model, prompt: req.prompt }
+  if (count > 1) body.num_images = count
+  if (req.aspect_ratio) body.aspect_ratio = req.aspect_ratio
+  if (req.size) body.image_size = req.size
+  if (req.quality) body.quality = req.quality
+  if (imageUrls.length > 0) body.image_urls = imageUrls
+  Object.assign(body, req.extra ?? {})
+
+  const uuid = (await $.process.run(['uuidgen'])).stdout.trim()
+  const headers = { ...auth, 'Content-Type': 'application/json', 'Idempotency-Key': uuid || `${base}-${await $.clock.now()}` }
+
+  type SumeJob = {
+    request_id?: string
+    job?: { id?: string; status?: string }
+    job_id?: string
+    sume_status?: string
+    status_url?: string
+    result_url?: string
+    terminal?: boolean
+    next_poll_after_seconds?: number
+  }
+  let submitted: SumeJob | undefined
+  for (let attempt = 0; !submitted; attempt++) {
+    // Same Idempotency-Key on a retry: Sume hands back the original job, never a second charge.
+    const res = await $.http.fetch(`${SUME_API}/v1/image-router/generate`, { method: 'POST', headers, body: JSON.stringify(body) })
+    if (res.ok) submitted = (JSON.parse(res.text) as { data: SumeJob }).data
+    else if (attempt < 3 && sumeRetryable(res)) await $.clock.sleep(retryAfterMs(res))
+    else throw new Error(`Sume ${sumeError(res)}`)
+  }
+
+  const jobId = submitted.job?.id ?? submitted.request_id ?? ''
+  const statusUrl = submitted.status_url ?? `${SUME_API}/v1/jobs/${jobId}/status`
+  const resultUrl = submitted.result_url ?? `${SUME_API}/v1/jobs/${jobId}/result`
+  let state = submitted.job?.status ?? 'queued'
+  let terminal = !!submitted.terminal
+  let waitMs = (submitted.next_poll_after_seconds ?? 2) * 1000
+  const deadline = (await $.clock.now()) + 5 * 60_000
+  while (!terminal) {
+    if ((await $.clock.now()) > deadline) throw new Error(`Sume: job ${jobId} still running after 5 minutes (it keeps running; check it later rather than resubmitting)`)
+    await $.clock.sleep(waitMs)
+    const res = await $.http.fetch(statusUrl, { headers: auth })
+    if (res.status === 429 || res.status >= 500) {
+      waitMs = retryAfterMs(res)
+      continue
+    }
+    if (!res.ok) throw new Error(`Sume status ${sumeError(res)}`)
+    const data = (JSON.parse(res.text) as { data: SumeJob }).data
+    terminal = !!data.terminal
+    state = data.sume_status ?? state
+    waitMs = Math.max(1, data.next_poll_after_seconds ?? 2) * 1000
+  }
+
+  if (state !== 'completed') {
+    let reason = state
+    const job = await $.http.fetch(`${SUME_API}/v1/jobs/${jobId}`, { headers: auth })
+    try {
+      const data = (JSON.parse(job.text) as { data?: { error?: unknown; job?: { error?: unknown } } }).data
+      const err = data?.error ?? data?.job?.error
+      if (typeof err === 'string') reason = err
+      else if (err && typeof err === 'object') reason = (err as { message?: string }).message ?? JSON.stringify(err).slice(0, 300)
+    } catch {}
+    throw new Error(`Sume job ${state}: ${reason}`)
+  }
+
+  const result = await $.http.fetch(resultUrl, { headers: auth })
+  if (!result.ok) throw new Error(`Sume result ${sumeError(result)}`)
+  type Artifact = { type?: string; url?: string; content_type?: string }
+  const artifacts = ((JSON.parse(result.text) as { data?: { result?: { artifacts?: Artifact[] } } }).data?.result?.artifacts ?? []).filter(
+    a => a.url && (a.type === 'image' || a.content_type?.startsWith('image/')),
+  )
+  if (artifacts.length === 0) throw new Error(`Sume returned no images (job ${jobId})`)
+
+  const files: string[] = []
+  for (const [i, artifact] of artifacts.entries()) {
+    const fromType = artifact.content_type?.split('/')[1]?.replace('jpeg', 'jpg')
+    const fromUrl = /\.(png|jpe?g|webp|gif)(\?|$)/i.exec(artifact.url ?? '')?.[1]?.toLowerCase().replace('jpeg', 'jpg')
+    const path = `${dir}/${base}${i > 0 ? `-${i + 1}` : ''}.${fromType ?? fromUrl ?? 'png'}`
+    await download($, artifact.url as string, path)
+    files.push(path)
+  }
+  return { provider: 'sume', model, files, note: `Sume job ${jobId}` }
+}
+
 const errorMessage = (json: string) => {
   try {
     const parsed = JSON.parse(json) as { error?: { message?: string } | string; detail?: string }
@@ -425,18 +586,20 @@ const generate = async ($: Dollar, req: GenerateInput): Promise<{ generated: Gen
   const current = await read($, settings)
   let provider: ImgProvider = req.provider ?? current.provider
   if (!keys[provider]) {
-    const other: ImgProvider = provider === 'openai' ? 'replicate' : 'openai'
-    if (req.provider || !keys[other]) {
+    const available = PROVIDERS.filter(p => keys[p])
+    const fallback = available[0]
+    if (req.provider || !fallback) {
       throw new Error(
-        keys[other]
-          ? `No ${provider} key is set; ${other} is available. Call again with provider "${other}" or paste a key in the Images pane (/images).`
-          : 'No image API key is set. Paste an OpenAI or Replicate key in the Images pane (/images), or export OPENAI_API_KEY / REPLICATE_API_TOKEN.',
+        fallback
+          ? `No ${provider} key is set; ${available.join(', ')} ${available.length === 1 ? 'is' : 'are'} available. Call again with provider "${fallback}" or paste a key in the Images pane (/images).`
+          : 'No image API key is set. Paste an OpenAI, Replicate or Sume key in the Images pane (/images), or export OPENAI_API_KEY / REPLICATE_API_TOKEN / SUME_API_KEY.',
       )
     }
-    provider = other
+    provider = fallback
   }
   const key = keys[provider] as string
-  const model = req.model ?? (provider === 'openai' ? current.openaiModel : current.replicateModel)
+  const model =
+    req.model ?? (provider === 'openai' ? current.openaiModel : provider === 'replicate' ? current.replicateModel : current.sumeModel)
   const dir = await resolveOutputDir($, req.output_dir)
   const base = req.filename?.trim() || `${stamp(await $.clock.now())}-${slug(req.prompt)}`
 
@@ -446,7 +609,9 @@ const generate = async ($: Dollar, req: GenerateInput): Promise<{ generated: Gen
     const generated =
       provider === 'openai'
         ? await generateOpenAI($, key, model, req, dir, base)
-        : await generateReplicate($, key, model, req, dir, base)
+        : provider === 'replicate'
+          ? await generateReplicate($, key, model, req, dir, base)
+          : await generateSume($, key, model, req, dir, base)
     const entries: ImgEntry[] = []
     for (const path of generated.files) {
       const { width, height } = await dimensions($, path)
@@ -489,7 +654,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'generate_image',
       description:
-        'Generate or edit images with OpenAI (gpt-image-1, dall-e-3) or Replicate (Flux, Ideogram, Recraft, Imagen, Seedream, SD 3.5, any owner/name). Saves PNG/JPG files to disk and returns their paths; the Images pane shows a gallery. Use reference_images to edit or guide from existing files.',
+        'Generate or edit images with OpenAI (gpt-image-1, dall-e-3), Replicate (Flux, Ideogram, Recraft, Imagen, Seedream, SD 3.5, any owner/name) or Sume (gpt-image-2, nano-banana-pro, Seedream, Ideogram, Recraft, Grok Imagine). Saves PNG/JPG files to disk and returns their paths; the Images pane shows a gallery. Use reference_images to edit or guide from existing files.',
       inputSchema: INPUT_SCHEMA,
     })
     await $.command.register({ name: 'images', description: 'Open the image gallery and settings pane' })
@@ -502,7 +667,7 @@ export const register: Register = on => {
     } catch (error) {
       problem = error instanceof Error ? error.message : String(error)
     }
-    const has = problem ? 'keys not loaded' : `OpenAI key: ${keys.openai ? 'yes' : 'no'} · Replicate key: ${keys.replicate ? 'yes' : 'no'}`
+    const has = problem ? 'keys not loaded' : PROVIDERS.map(p => `${LABEL[p]} key: ${keys[p] ? 'yes' : 'no'}`).join(' · ')
     $.ui.toast(`Image mod loaded (${has}). Type /images for the pane.`)
     if (problem) $.ui.log(`image-mod: startup problem: ${problem}`)
     return next(e)
@@ -564,29 +729,36 @@ export const register: Register = on => {
     const shown = list.slice(pageIndex * PAGE_SIZE, pageIndex * PAGE_SIZE + PAGE_SIZE)
     const Svg = e.surface === 'desktop' ? $.ui.resolve(e).Svg : undefined
 
-    const providerOptions = [
-      { value: 'openai', label: ks.openai.has ? 'OpenAI' : 'OpenAI (no key)' },
-      { value: 'replicate', label: ks.replicate.has ? 'Replicate' : 'Replicate (no key)' },
+    // A $.state value written by an older version may lack a newer provider.
+    const info = (provider: ImgProvider) => ks[provider] ?? NO_KEY
+    const providerOptions = PROVIDERS.map(value => ({ value, label: info(value).has ? LABEL[value] : `${LABEL[value]} (no key)` }))
+    const sumeModel = s.sumeModel ?? DEFAULT_SETTINGS.sumeModel
+    const customFor = s.provider === 'sume' ? 'sume' : 'replicate'
+    const presets = customFor === 'sume' ? SUME_MODELS : REPLICATE_MODELS
+    const chosen = customFor === 'sume' ? sumeModel : s.replicateModel
+    const modelOptions = [
+      ...presets.map(value => ({ value, label: value })),
+      ...(presets.includes(chosen) ? [] : [{ value: chosen, label: `${chosen} (custom)` }]),
+      { value: CUSTOM, label: customFor === 'sume' ? 'Custom model id…' : 'Custom owner/name…' },
     ]
-    const isPreset = REPLICATE_MODELS.includes(s.replicateModel)
-    const replicateOptions = [
-      ...REPLICATE_MODELS.map(value => ({ value, label: value })),
-      ...(isPreset ? [] : [{ value: s.replicateModel, label: `${s.replicateModel} (custom)` }]),
-      { value: CUSTOM, label: 'Custom owner/name…' },
-    ]
+    const pickModel = (model: string) =>
+      Promise.all([
+        saveSettings($, customFor === 'sume' ? { sumeModel: model } : { replicateModel: model }),
+        update($, editing, old => ({ ...old, customModel: false })),
+      ])
 
     const keyRow = (provider: ImgProvider) => {
-      const info = ks[provider]
-      const label = provider === 'openai' ? 'OpenAI' : 'Replicate'
-      const isEditing = provider === 'openai' ? ed.openaiKey : ed.replicateKey
-      const flag = provider === 'openai' ? 'openaiKey' : 'replicateKey'
-      if (!info.has || isEditing) {
+      const status = info(provider)
+      const label = LABEL[provider]
+      const flag = keyFlag(provider)
+      const isEditing = !!ed[flag]
+      if (!status.has || isEditing) {
         return (
           <Box flexDirection="row" gap={1} alignItems="center">
             <Input
               key={`${provider}-key`}
               label={`${label} API key`}
-              placeholder={provider === 'openai' ? 'sk-… then Enter' : 'r8_… then Enter'}
+              placeholder={KEY_PLACEHOLDER[provider]}
               submitLabel="save"
               onSubmit={value => void saveKey($, provider, value)}
             />
@@ -601,12 +773,12 @@ export const register: Register = on => {
       return (
         <Box flexDirection="row" gap={1} alignItems="center">
           <Text>
-            {label} key: {info.hint} <Text dimColor>({info.source === 'env' ? 'from environment' : 'saved from pane'})</Text>
+            {label} key: {status.hint} <Text dimColor>({status.source === 'env' ? 'from environment' : 'saved from pane'})</Text>
           </Text>
           <Button key={`${provider}-replace`} dimColor onPress={() => void update($, editing, old => ({ ...old, [flag]: true }))}>
             Replace
           </Button>
-          {info.source === 'pane' && (
+          {status.source === 'pane' && (
             <Button key={`${provider}-forget`} dimColor onPress={() => void forgetKey($, provider)}>
               Forget
             </Button>
@@ -653,7 +825,7 @@ export const register: Register = on => {
         <Box flexDirection="row" gap={2} flexWrap="wrap" alignItems="center">
           <Select
             key="provider"
-            label="ImgProvider"
+            label="Provider"
             options={providerOptions}
             value={s.provider}
             onSelect={value => void saveSettings($, { provider: value as ImgProvider })}
@@ -668,35 +840,33 @@ export const register: Register = on => {
             />
           ) : (
             <Select
-              key="replicate-model"
+              key={`${customFor}-model`}
               label="Model"
-              options={replicateOptions}
-              value={ed.customModel ? CUSTOM : s.replicateModel}
+              options={modelOptions}
+              value={ed.customModel ? CUSTOM : chosen}
               onSelect={value =>
-                void (value === CUSTOM
-                  ? update($, editing, old => ({ ...old, customModel: true }))
-                  : Promise.all([saveSettings($, { replicateModel: value }), update($, editing, old => ({ ...old, customModel: false }))]))
+                void (value === CUSTOM ? update($, editing, old => ({ ...old, customModel: true })) : pickModel(value))
               }
             />
           )}
         </Box>
-        {s.provider === 'replicate' && ed.customModel && (
+        {s.provider !== 'openai' && ed.customModel && (
           <Input
-            key="custom-model"
-            label="Replicate model"
-            placeholder="owner/name or owner/name:version, then Enter"
+            key={`custom-model-${customFor}`}
+            label={`${LABEL[customFor]} model`}
+            placeholder={customFor === 'sume' ? 'model id, e.g. seedream-4-5-edit, then Enter' : 'owner/name or owner/name:version, then Enter'}
             onSubmit={value => {
               const model = value.trim()
-              if (!/^[\w.-]+\/[\w.-]+(:[\w]+)?$/.test(model)) {
-                $.ui.toast('Model must look like owner/name')
+              const valid = customFor === 'sume' ? /^[\w.-]+$/.test(model) : /^[\w.-]+\/[\w.-]+(:[\w]+)?$/.test(model)
+              if (!valid) {
+                $.ui.toast(customFor === 'sume' ? 'Model must be a Sume model id' : 'Model must look like owner/name')
                 return
               }
-              void Promise.all([saveSettings($, { replicateModel: model }), update($, editing, old => ({ ...old, customModel: false }))])
+              void pickModel(model)
             }}
           />
         )}
-        {keyRow('openai')}
-        {keyRow('replicate')}
+        {PROVIDERS.map(keyRow)}
         <Input
           key="output-dir"
           label="Save to"
@@ -704,8 +874,8 @@ export const register: Register = on => {
           value={s.outputDir}
           onSubmit={value => void saveSettings($, { outputDir: value.trim() })}
         />
-        {!ks.openai.has && !ks.replicate.has && (
-          <Text color="yellow">No key set yet. Paste one above, or export OPENAI_API_KEY or REPLICATE_API_TOKEN and restart.</Text>
+        {!PROVIDERS.some(p => info(p).has) && (
+          <Text color="yellow">No key set yet. Paste one above, or export OPENAI_API_KEY, REPLICATE_API_TOKEN or SUME_API_KEY and restart.</Text>
         )}
         {status && <Text color="yellow">{status}</Text>}
         <Box flexDirection="row" gap={2} alignItems="center">

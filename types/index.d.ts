@@ -1,4 +1,4 @@
-export type ImgProvider = 'openai' | 'replicate'
+export type ImgProvider = 'openai' | 'replicate' | 'sume'
 
 /** Session defaults the pane edits and the tool falls back to. */
 export type ImgSettings = {
@@ -6,14 +6,14 @@ export type ImgSettings = {
   openaiModel: string
   /** `owner/name`, optionally `owner/name:version`. */
   replicateModel: string
+  /** A Sume image-router model id, e.g. `gpt-image-2` or `nano-banana-pro`. */
+  sumeModel: string
   outputDir: string
 }
 
 /** Whether each provider has a key and where it came from. Never the key. */
-export type ImgKeyStatus = {
-  openai: { has: boolean; source: 'env' | 'pane' | 'none'; hint: string }
-  replicate: { has: boolean; source: 'env' | 'pane' | 'none'; hint: string }
-}
+export type ImgKeyInfo = { has: boolean; source: 'env' | 'pane' | 'none'; hint: string }
+export type ImgKeyStatus = Record<ImgProvider, ImgKeyInfo>
 
 /** One generated image in the gallery. */
 export type ImgEntry = {
@@ -35,6 +35,7 @@ export type ImgEntry = {
 export type ImgEditing = {
   openaiKey: boolean
   replicateKey: boolean
+  sumeKey: boolean
   customModel: boolean
 }
 
